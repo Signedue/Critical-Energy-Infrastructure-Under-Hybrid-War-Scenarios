@@ -65,7 +65,7 @@ def mathematical_model(graph_object):
     model.arc_cap_lower = pyo.Constraint(model.Arcs, rule=arc_cap_lower_rule)
 
     # Solve
-    solver = pyo.SolverFactory("glpk")
+    solver = pyo.SolverFactory("appsi_highs")
     result = solver.solve(model, tee=False)
 
     # Extract results
@@ -91,9 +91,19 @@ def mathematical_model(graph_object):
         for n in nodes
     )
 
+    # get how many groups there are in the graph after the disruption
+    if graph_object.is_directed():
+        num_groups = nx.number_weakly_connected_components(graph_object)
+    else:
+        num_groups = nx.number_connected_components(graph_object)
+    
+
     return model, {
         "status": status,
         "total_imbalance_MW": total_imbalance,
+        "total_unmet_demand_MW": sum(node_results[n]["unmet_demand_MW"] for n in nodes),
+        "total_oversupply_MW": sum(node_results[n]["oversupply_MW"] for n in nodes),
+        "num_groups": num_groups,
         "node_results": node_results,
         "arc_results": arc_results,
     }
