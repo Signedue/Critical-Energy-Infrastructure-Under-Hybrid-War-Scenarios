@@ -435,7 +435,7 @@ def print_graph(G):
     plt.show()
 
 
-
+# returns the baseline disaggregated graph
 def main_clean(bus, line, gen, load, hvdc, transformer2, transformer3):
     clean_gen = get_clean_generation(gen, load, hvdc)
     generation_MW = clean_gen["supply"].sum()
@@ -452,3 +452,5 @@ def main_clean(bus, line, gen, load, hvdc, transformer2, transformer3):
 
     G = make_disaggregated_graph(nodes_final, edges_final)
     G.name = "Baseline"
+
+    return G
