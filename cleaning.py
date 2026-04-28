@@ -348,7 +348,9 @@ def make_disaggregated_graph(nodes_final, edges_final):
             demand=float(row["demand"]),
             p_min=float(row["p_min"]),
             p_max=float(row["p_max"]),
-            source=row["source"]
+            source=row["source"],
+            lat=float(row["lat"]) if pd.notna(row.get("lat")) else None,
+            lon=float(row["lon"]) if pd.notna(row.get("lon")) else None,
         )
 
     # Build lookup: bus_index -> list of sub-node IDs
@@ -418,20 +420,38 @@ def aggregate_graph(G_disagg, edges_final):
 
 
 def print_graph(G):
+    plt.figure(figsize=(12, 10))
 
-    plt.figure(figsize=(10, 8))
+    # Use lon/lat as position; fall back to spring layout for nodes missing coordinates
+    pos_geo, pos_spring_needed = {}, []
+    for node, data in G.nodes(data=True):
+        if data.get("lon") is not None and data.get("lat") is not None:
+            pos_geo[node] = (data["lon"], data["lat"])
+        else:
+            pos_spring_needed.append(node)
 
-    pos = nx.spring_layout(G, seed=42)  # layout algorithm
+    if pos_spring_needed:
+        fallback = nx.spring_layout(G, seed=42)
+        for node in pos_spring_needed:
+            pos_geo[node] = fallback[node]
+
+    node_colors = [
+        "red" if G.nodes[n].get("source") == "international" else "steelblue"
+        for n in G.nodes()
+    ]
 
     nx.draw(
         G,
-        pos,
-        node_size=10,
+        pos_geo,
+        node_color=node_colors,
+        node_size=15,
         edge_color="gray",
+        width=0.5,
         with_labels=False
     )
 
     plt.title("Danish Transmission Network (Topology)")
+    plt.tight_layout()
     plt.show()
 
 
