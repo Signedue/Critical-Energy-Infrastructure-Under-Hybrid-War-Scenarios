@@ -9,7 +9,10 @@ import pyomo.environ as pyo
 
 def mathematical_model(graph_object):
     if not isinstance(graph_object, nx.DiGraph):
-        graph_object = nx.DiGraph(graph_object)
+        dg = nx.DiGraph()
+        dg.add_nodes_from(graph_object.nodes(data=True))
+        dg.add_edges_from(graph_object.edges(data=True))
+        graph_object = dg
     model = pyo.ConcreteModel()
 
     # Deinfe the sets
