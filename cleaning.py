@@ -45,6 +45,10 @@ def get_all_nodes(bus):
     nodes["name"] = nodes["station_full_name"].fillna("").astype(str).str.strip()
     nodes.loc[nodes["name"] == "", "name"] = nodes["bus_name"]
     nodes.head()
+
+    # delet these nodes manually, as the are unconnected
+    nodes = nodes[~nodes["bus_index"].isin([212, 213])]
+
     return nodes
 
 # returns file with cleaned generation data and sources
@@ -88,8 +92,9 @@ def get_clean_generation(gen, load, hvdc):
     return gen_clean
 
 
-def get_clean_load(load):
+def get_clean_load(load, generation_MW):
     # Assumption: Load Index corresponds to Bus Index
+
     load["Load Index"] = pd.to_numeric(load["Load Index"], errors="coerce")
     load["Act.P[MW]"] = to_num(load["Act.P[MW]"])
 
@@ -104,8 +109,13 @@ def get_clean_load(load):
     load_agg = load_agg.dropna(subset=["bus_index"])
     load_agg["bus_index"] = load_agg["bus_index"].astype(int)
 
-    # for demands taht are negative, and add it to gen as supply, since this is likely a border flow with negative convention, delet row after
-    load_agg = load_agg[load_agg["demand"] >= 0]
+    # delete nodes with bus_index 0-3, as the are international connections, taken account in the next function
+    load_agg = load_agg[load_agg["bus_index"] > 3]
+
+
+    #Adjust demand, so it equals our supply, to simplify our models. IN reality  this is the loss
+    demand_adjustment = generation_MW/load_agg["demand"].sum()
+    load_agg["demand"] = load_agg["demand"] * demand_adjustment
 
     return load_agg
 
@@ -160,7 +170,7 @@ def get_clean_border_flows(load, hvdc):
 
 
 
-def get_clean_edges(line, transformer2, transformer3):
+def get_all_edges(line, transformer2, transformer3):
     # Cleaning transformer2
     transformer2["High.V Bus Index"] = pd.to_numeric(transformer2["High.V Bus Index"], errors="coerce")
     transformer2["Low.V Bus Index"] = pd.to_numeric(transformer2["Low.V Bus Index"], errors="coerce")
@@ -294,3 +304,151 @@ def get_clean_edges(line, transformer2, transformer3):
     
     return edges_final[['node1', 'node2', 'name', 'capacity', 'area_code', 'line_type', 'voltage_kv', 'length_km', 'edge_type']]
 
+
+
+def populate_nodes(nodes, clean_gen, clean_load):
+    # Aggregate gen to one row per (bus, source)
+    gen_agg = (
+        clean_gen.groupby(["bus_index", "gen_source"])
+        .agg(supply=("supply", "sum"), p_min=("p_min", "sum"), p_max=("p_max", "sum"))
+        .reset_index()
+        .rename(columns={"gen_source": "source"})
+    )
+
+    # Expand nodes: one row per (node, source); nodes with no gen get one row with NaN
+    nodes_expanded = nodes.merge(gen_agg, on="bus_index", how="left")
+
+    # Add demand — split equally across the source rows for each node
+    nodes_expanded = nodes_expanded.merge(clean_load[["bus_index", "demand"]], on="bus_index", how="left")
+    nodes_expanded["demand"] = nodes_expanded["demand"].fillna(0.0)
+    rows_per_node = nodes_expanded.groupby("bus_index")["bus_index"].transform("size")
+    nodes_expanded["demand"] = nodes_expanded["demand"] / rows_per_node
+
+    for col in ["supply", "p_min", "p_max"]:
+        nodes_expanded[col] = nodes_expanded[col].fillna(0.0)
+    nodes_expanded["source"] = nodes_expanded["source"].fillna("")
+
+    return nodes_expanded
+
+
+def make_disaggregated_graph(nodes_final, edges_final):
+    G = nx.Graph()
+
+    # Add one node per (bus, source) row with ID "bus-counter"
+    bus_counters = {}
+    for _, row in nodes_final.iterrows():
+        bus = int(row["bus_index"])
+        count = bus_counters.get(bus, 0)
+        bus_counters[bus] = count + 1
+        G.add_node(
+            f"{bus}-{count}",
+            bus_index=bus,
+            name=row["name"],
+            supply=float(row["supply"]),
+            demand=float(row["demand"]),
+            p_min=float(row["p_min"]),
+            p_max=float(row["p_max"]),
+            source=row["source"]
+        )
+
+    # Build lookup: bus_index -> list of sub-node IDs
+    bus_subnodes = {}
+    for node_id, data in G.nodes(data=True):
+        bus_subnodes.setdefault(data["bus_index"], []).append(node_id)
+
+    # Internal bus-bar edges: connect all sub-nodes of the same bus with infinite capacity
+    for subnodes in bus_subnodes.values():
+        for i in range(len(subnodes) - 1):
+            G.add_edge(subnodes[i], subnodes[i + 1], name="busbar", capacity=float("inf"))
+
+    # External edges: one edge per physical line, between the -0 nodes of each bus
+    for _, row in edges_final.iterrows():
+        b1, b2 = int(row["node1"]), int(row["node2"])
+        n1, n2 = f"{b1}-0", f"{b2}-0"
+        if G.has_node(n1) and G.has_node(n2):
+            G.add_edge(
+                n1, n2,
+                name=row["name"],
+                capacity=float(row["capacity"]) if pd.notna(row["capacity"]) else 0.0
+            )
+
+    return G
+
+
+def aggregate_graph(G_disagg, edges_final):
+    """Collapse a disaggregated graph back to one node per bus for the math model."""
+    G = nx.Graph()
+
+    # Group sub-nodes by bus and combine their attributes
+    bus_attrs = {}
+    for _, data in G_disagg.nodes(data=True):
+        bus = data["bus_index"]
+        if bus not in bus_attrs:
+            bus_attrs[bus] = {"name": data["name"], "supply": 0.0, "demand": 0.0,
+                              "p_min": 0.0, "p_max": 0.0, "sources": []}
+        bus_attrs[bus]["supply"] += data["supply"]
+        bus_attrs[bus]["demand"] += data["demand"]
+        bus_attrs[bus]["p_min"] += data["p_min"]
+        bus_attrs[bus]["p_max"] += data["p_max"]
+        if data["source"]:
+            bus_attrs[bus]["sources"].append(data["source"])
+
+    for bus, attrs in bus_attrs.items():
+        G.add_node(
+            bus,
+            name=attrs["name"],
+            supply=attrs["supply"],
+            demand=attrs["demand"],
+            p_min=attrs["p_min"],
+            p_max=attrs["p_max"],
+            source=", ".join(sorted(set(attrs["sources"])))
+        )
+
+    # Only add edges where both buses still exist in the aggregated graph
+    for _, row in edges_final.iterrows():
+        b1, b2 = int(row["node1"]), int(row["node2"])
+        if G.has_node(b1) and G.has_node(b2):
+            G.add_edge(
+                b1, b2,
+                name=row["name"],
+                capacity=float(row["capacity"]) if pd.notna(row["capacity"]) else 0.0
+            )
+
+    return G
+
+
+def print_graph(G):
+
+    plt.figure(figsize=(10, 8))
+
+    pos = nx.spring_layout(G, seed=42)  # layout algorithm
+
+    nx.draw(
+        G,
+        pos,
+        node_size=10,
+        edge_color="gray",
+        with_labels=False
+    )
+
+    plt.title("Danish Transmission Network (Topology)")
+    plt.show()
+
+
+
+def main_clean(bus, line, gen, load, hvdc, transformer2, transformer3):
+    clean_gen = get_clean_generation(gen, load, hvdc)
+    generation_MW = clean_gen["supply"].sum()
+    clean_load = get_clean_load(load, generation_MW)
+
+    nodes = get_all_nodes(bus)
+    nodes_final = populate_nodes(nodes, clean_gen, clean_load)
+    edges_final = get_all_edges(line, transformer2, transformer3)
+
+    out_file = "danish_grid_graph_ready.xlsx"
+    with pd.ExcelWriter(out_file, engine="openpyxl") as writer:
+        nodes_final.to_excel(writer, sheet_name="nodes", index=False)
+        edges_final.to_excel(writer, sheet_name="edges", index=False)
+
+    G = make_disaggregated_graph(nodes_final, edges_final)
+    G.name = "Baseline"
