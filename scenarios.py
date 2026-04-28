@@ -1,16 +1,16 @@
 """
 scenarios.py
 ------------
-All scenario definitions and Monte Carlo sampling machinery for the Danish
-grid resilience project. Import this in the main notebook.
+Scenario definitions and Monte Carlo sampling machinery for the Danish
+grid resilience project. Outputs balanced scenario graphs to be fed into
+the attack module.
 
 Usage:
-    from scenarios import SCENARIOS, DEFAULT_SIGMAS
-    from scenarios import apply_scenario_mean, sample_scenario, run_mc, eval_grid_balance
+    from scenarios import SCENARIOS, DEFAULT_SIGMAS, SIGMAS
+    from scenarios import prepare_graph, apply_scenario_mean, sample_scenario
 """
 
 import numpy as np
-import pandas as pd
 import networkx as nx
 from copy import deepcopy
 
@@ -19,7 +19,7 @@ from copy import deepcopy
 # SCENARIO DEFINITIONS
 # =============================================================================
 
-SCENARIO_FALLBACKS = {
+SCENARIOS = {
 
     # ── WEATHER & GENERATION SCENARIOS ────────────────────────────────────────
 
@@ -278,8 +278,6 @@ SCENARIO_FALLBACKS = {
     },
 }
 
-SCENARIOS = SCENARIO_FALLBACKS
-
 # =============================================================================
 # MC SAMPLER
 # =============================================================================
@@ -349,45 +347,183 @@ def _apply_tail_risk(rng, value, prob=0.1):
     return value * rng.uniform(0.5, 0.8) if rng.random() < prob else value
 
 
+# ---------------------------------------------------------------------------
+# Graph preparation — call once after loading network_graph.pkl
+# ---------------------------------------------------------------------------
+
+_FOREIGN_SOURCES = {'sweden', 'norway', 'germany', 'netherlands', 'uk'}
+
+_HVDC_EDGE_KEYS = [
+    ('skagerak',   'hvdc_skagerrak_pct'),
+    ('skagerrak',  'hvdc_skagerrak_pct'),
+    ('kontiskan',  'hvdc_kontiskan_pct'),
+    ('kontek',     'hvdc_kontek_pct'),
+    ('cobra',      'hvdc_cobra_pct'),
+    ('storebelt',  'hvdc_storebelt_pct'),
+    ('storebælt',  'hvdc_storebelt_pct'),
+    ('viking',     'hvdc_viking_pct'),
+]
+
+
+def prepare_graph(G):
+    """Store supply_base / demand_base / capacity_base on graph elements.
+
+    Must be called once on the loaded network_graph.pkl before any scenario
+    is applied. Safe to call multiple times.
+    """
+    for _, d in G.nodes(data=True):
+        d.setdefault('supply_base',  d.get('supply',   0.0))
+        d.setdefault('demand_base',  d.get('demand',   0.0))
+    for _, _, d in G.edges(data=True):
+        d.setdefault('capacity_base', d.get('capacity', 0.0))
+    return G
+
+
+def _hvdc_factor_for(name, draw):
+    """Return the HVDC pct factor for a node/edge name, or None if not HVDC."""
+    if not isinstance(name, str):
+        return None
+    name_l = name.lower()
+    for keyword, factor_key in _HVDC_EDGE_KEYS:
+        if keyword in name_l:
+            return draw.get(factor_key, 1.0)
+    return None
+
+
+def _src_str(source):
+    """Normalise a node's source attribute to a lowercase string."""
+    if not isinstance(source, str):
+        return ''   # float NaN or other non-string → treat as unknown/thermal
+    return source.strip().lower()
+
+
+def _is_foreign(source):
+    return _src_str(source) in _FOREIGN_SOURCES
+
+
+def _is_dispatchable(source):
+    """Gas-containing nodes and unknown-source thermal plants are dispatchable slack."""
+    src = _src_str(source)
+    if src in ('', 'nan'):
+        return True   # NaN / unknown source = large thermal/CHP
+    return 'gas' in src
+
+
+def _generation_factor(source, draw):
+    """Initial generation scaling factor for a supply node.
+
+    Dispatchable nodes (gas, thermal) get an initial factor too, but the
+    rebalancer will override them to enforce supply == demand.
+    Returns 1.0 for foreign nodes (HVDC nodes are handled by name lookup).
+    """
+    src = _src_str(source)
+    if src in ('', 'nan'):
+        return draw.get('thermal_factor', 1.0)   # unknown source = thermal/CHP
+    if src in _FOREIGN_SOURCES:
+        return 1.0
+    if 'gas' in src:
+        return draw.get('gas_factor', draw.get('thermal_factor', 1.0))
+    if 'wind_offshore' in src:
+        return draw.get('wind_offshore_factor', 1.0)
+    if 'wind_onshore' in src:
+        return draw.get('wind_onshore_factor', 1.0)
+    if 'solar' in src:
+        return draw.get('solar_factor', 1.0)
+    return 1.0   # hydro / other — unchanged
+
+
+# ---------------------------------------------------------------------------
+# Rebalancer
+# ---------------------------------------------------------------------------
+
+def _rebalance(G2):
+    """Adjust dispatchable generation so total supply == total demand.
+
+    Uses gas nodes as primary slack, then thermal (NaN-source) nodes.
+    Scales each group proportionally. Warns if gap cannot be closed.
+    """
+    def _gap(G):
+        s = sum(d.get('supply', 0.0) for _, d in G.nodes(data=True))
+        d = sum(d.get('demand', 0.0) for _, d in G.nodes(data=True))
+        return d - s   # positive = deficit, negative = surplus
+
+    gap = _gap(G2)
+    if abs(gap) < 1.0:
+        return
+
+    for src_type in ('gas', 'thermal'):
+        slack = [(n, d) for n, d in G2.nodes(data=True)
+                 if d.get('supply_base', d.get('supply', 0.0)) > 0
+                 and _is_dispatchable(d.get('source', ''))
+                 and (src_type == 'gas') == ('gas' in _src_str(d.get('source', '')))]
+        if not slack:
+            continue
+
+        total = sum(d.get('supply', 0.0) for _, d in slack)
+        if total <= 0:
+            continue
+
+        adjust = gap if gap > 0 else max(gap, -total)   # floor at zero
+        scale  = (total + adjust) / total
+        for _, d in slack:
+            d['supply'] = max(0.0, d['supply'] * scale)
+
+        gap = _gap(G2)
+        if abs(gap) < 1.0:
+            return
+
+    total_demand = sum(d.get('demand', 0.0) for _, d in G2.nodes(data=True))
+    if abs(gap) > max(1.0, 0.01 * total_demand):
+        import warnings
+        warnings.warn(
+            f"_rebalance: residual gap = {gap:.1f} MW "
+            f"({gap / total_demand * 100:.1f}% of demand). "
+            "Scenario may be structurally infeasible with this grid."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Core scenario application
+# ---------------------------------------------------------------------------
+
 def apply_scenario_to_grid(G, draw):
-    # takes a factor dict and returns a modified copy of the graph
-    # with supply/demand/capacity scaled accordingly
-    # note: gas nodes are left at 100% - no gas_factor in current scenarios
-    # (TODO: add gas_factor for S12 gas shortage if needed later)
+    """Return a scenario-adjusted copy of G.
+
+    G must have been through prepare_graph() at least once.
+    After all fixed/HVDC scaling, calls _rebalance() to close the
+    supply-demand gap using dispatchable (gas/thermal) nodes as slack.
+    """
     G2 = G.copy()
 
     for n, data in G2.nodes(data=True):
-        src = data.get("source", "")
-        if   "wind_offshore" in src: f = draw.get("wind_offshore_factor", 1)
-        elif "wind_onshore"  in src: f = draw.get("wind_onshore_factor",  1)
-        elif "solar"         in src: f = draw.get("solar_factor",         1)
-        elif "thermal"       in src: f = draw.get("thermal_factor",       1)
-        elif "gas"           in src:
-            # use gas_factor if explicitly set, otherwise fall back to thermal_factor
-            # this matters most for S12 where gas is severely constrained
-            f = draw.get("gas_factor", draw.get("thermal_factor", 1))
-        else:                        f = 1  # hydro / substation unchanged
+        supply_base = data.get('supply_base', data.get('supply', 0.0))
+        demand_base = data.get('demand_base', data.get('demand', 0.0))
+        name        = data.get('name', '')
+        source      = data.get('source', '')
 
-        if "p_max_base" in data:
-            p_max = data["p_max_base"]
-            data["supply"] = max(data.get("p_min", 0), min(p_max * f, p_max))
+        # HVDC nodes identified by name (e.g. "HVDC STATION SKAGERAK POL 1")
+        hvdc_f = _hvdc_factor_for(name, draw)
+        if hvdc_f is not None:
+            data['supply'] = supply_base * hvdc_f
+            data['demand'] = demand_base * hvdc_f
+            continue
 
-        if "demand_base" in data:
-            data["demand"] = data["demand_base"] * draw.get("demand_factor", 1)
+        # Scale domestic supply
+        if supply_base > 0:
+            data['supply'] = supply_base * _generation_factor(source, draw)
 
+        # Scale domestic demand (not foreign nodes — their demand is their own)
+        if demand_base > 0 and not _is_foreign(source):
+            data['demand'] = demand_base * draw.get('demand_factor', 1.0)
+
+    # Scale HVDC edge capacities
     for u, v, data in G2.edges(data=True):
-        name = data.get("name", "").lower()
-        if   "kontek"    in name: f = draw.get("hvdc_kontek_pct",    1)
-        elif "cobra"     in name: f = draw.get("hvdc_cobra_pct",     1)
-        elif "storebelt" in name or "storebælt" in name:
-                                  f = draw.get("hvdc_storebelt_pct", 1)
-        elif "skagerrak" in name: f = draw.get("hvdc_skagerrak_pct", 1)
-        elif "kontiskan" in name: f = draw.get("hvdc_kontiskan_pct", 1)
-        elif "viking"    in name: f = draw.get("hvdc_viking_pct",    1)
-        else:                     f = 1
-        if "capacity_base" in data:
-            data["capacity"] = data["capacity_base"] * f
+        cap_base = data.get('capacity_base', data.get('capacity', 0.0))
+        hvdc_f   = _hvdc_factor_for(data.get('name', ''), draw)
+        if hvdc_f is not None:
+            data['capacity'] = cap_base * hvdc_f
 
+    _rebalance(G2)
     return G2
 
 
@@ -425,19 +561,6 @@ def sample_scenario(scenario_id, scenarios, sigmas, n=500, seed=42):
     return draws
 
 
-def run_mc(draws, G, eval_func):
-    # run each draw through the eval function and collect results
-    records = []
-    for draw in draws:
-        G_state = apply_scenario_to_grid(G, draw)
-        metrics = eval_func(G_state)
-        metrics["_mc_trial"] = draw["_mc_trial"]
-        records.append(metrics)
-    return pd.DataFrame(records)
-
-
-
-
 # =============================================================================
 # SCENARIO → GRAPH
 # =============================================================================
@@ -460,12 +583,15 @@ def apply_scenario_mean(G, scenario):
     mean_draw['_mc_trial'] = -1
     G2 = apply_scenario_to_grid(G, mean_draw)
 
-    # S10 storm day: overhead lines derate 20% due to ice/wind load
+    # S10 storm day: overhead AC lines derate due to ice/wind load
+    # applied AFTER rebalance so the capacity constraint is visible to the attack module
     line_f = scenario.get('line_capacity_factor', 1.0)
     if line_f != 1.0:
         for u, v, data in G2.edges(data=True):
-            if data.get('edge_type') == 'transmission' and data.get('capacity_base', 0) > 0:
-                data['capacity'] = data['capacity_base'] * line_f
+            cap_base = data.get('capacity_base', data.get('capacity', 0.0))
+            # only derate non-HVDC edges (HVDC are already handled by hvdc_*_pct)
+            if cap_base > 0 and _hvdc_factor_for(data.get('name', ''), mean_draw) is None:
+                data['capacity'] = cap_base * line_f
 
     # S13 second strike: remove nodes before attack starts
     # pre_remove_nodes: explicit list (static)
@@ -476,14 +602,14 @@ def apply_scenario_mean(G, scenario):
         else:
             print(f'  WARNING: {node_id} not found in graph')
 
-    # pre_remove_top_n: dynamically remove top-N substations by betweenness
-    # this way S13 always targets the most critical node regardless of graph version
+    # pre_remove_top_n: dynamically remove top-N non-generator nodes by betweenness
+    # targets pure substations (no generation) so we don't remove supply nodes
     n_remove = scenario.get('pre_remove_top_n', 0)
     if n_remove > 0:
         bc = nx.betweenness_centrality(G2, normalized=True)
-        # only consider substations - generators aren't standalone attack targets
         sub_bc = {n: v for n, v in bc.items()
-                  if G2.nodes[n].get('node_type') == 'substation'}
+                  if G2.nodes[n].get('supply_base', G2.nodes[n].get('supply', 0.0)) == 0.0
+                  and not _is_foreign(G2.nodes[n].get('source'))}
         top_nodes = sorted(sub_bc, key=sub_bc.get, reverse=True)[:n_remove]
         for node_id in top_nodes:
             name = G2.nodes[node_id].get('name', node_id)
@@ -497,45 +623,8 @@ def apply_scenario_mean(G, scenario):
 
 
 # =============================================================================
-# GRID EVALUATION + UNCERTAINTY WIDTHS
+# UNCERTAINTY WIDTHS
 # =============================================================================
-
-def eval_grid_balance(G_state):
-    # compute national + zonal supply/demand for one MC draw
-    supply = dk1_s = dk2_s = 0.0
-    demand = dk1_d = dk2_d = 0.0
-
-    for _, d in G_state.nodes(data=True):
-        ntype = d.get('node_type', '')
-        area  = d.get('area', '')
-
-        if ntype == 'generator':
-            s = d.get('supply', 0.0)
-            supply += s
-            if area == 'DK1':   dk1_s += s
-            elif area == 'DK2': dk2_s += s
-
-        elif ntype == 'substation':
-            dem = d.get('demand', 0.0)
-            demand += dem
-            if area == 'DK1':   dk1_d += dem
-            elif area == 'DK2': dk2_d += dem
-
-    bal = supply - demand
-    return {
-        'supply_mw'     : supply,
-        'demand_mw'     : demand,
-        'balance_mw'    : bal,
-        'deficit_mw'    : max(0.0, -bal),   # how short are we?
-        'surplus_mw'    : max(0.0,  bal),   # how much are we overproducing?
-        'dk1_balance_mw': dk1_s - dk1_d,
-        'dk2_balance_mw': dk2_s - dk2_d,
-        'dk1_supply_mw' : dk1_s,
-        'dk1_demand_mw' : dk1_d,
-        'dk2_supply_mw' : dk2_s,
-        'dk2_demand_mw' : dk2_d,
-    }
-
 
 # uncertainty widths for each factor - same as NB2
 DEFAULT_SIGMAS = {
