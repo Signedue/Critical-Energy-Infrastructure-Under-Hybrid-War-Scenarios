@@ -377,7 +377,7 @@ def make_disaggregated_graph(nodes_final, edges_final):
     return G
 
 
-def aggregate_graph(G_disagg, edges_final):
+def aggregate_graph(G_disagg, edges_final, dynamic_iternational=False):
     """Collapse a disaggregated graph back to one node per bus for the math model."""
     G = nx.Graph()
 
@@ -387,13 +387,38 @@ def aggregate_graph(G_disagg, edges_final):
         bus = data["bus_index"]
         if bus not in bus_attrs:
             bus_attrs[bus] = {"name": data["name"], "supply": 0.0, "demand": 0.0,
-                              "p_min": 0.0, "p_max": 0.0, "sources": []}
+                              "p_min": 0.0, "p_max": 0.0, "p_removable": 0.0, 'p_addable':0.0, "sources": [],
+                              "lat": None, "lon": None}
         bus_attrs[bus]["supply"] += data["supply"]
         bus_attrs[bus]["demand"] += data["demand"]
         bus_attrs[bus]["p_min"] += data["p_min"]
         bus_attrs[bus]["p_max"] += data["p_max"]
+        
+        # Make some sources dynamic. Wind can be truned off
+        if data['source'] == "wind_offshore" or data['source'] == "wind_onshore":
+            bus_attrs[bus]["p_removable"] += data["supply"] - data['p_min']
+        
+        if data['source'] == "gas":
+            bus_attrs[bus]["p_addable"] += data['p_max'] - data['supply']
+            bus_attrs[bus]["p_removable"] += data["supply"] - data['p_min']
+        
+        # hydro can be reduced by "0 %
+        if data['source'] == "hydro":
+            bus_attrs[bus]["p_addable"] += data['supply'] * 0.2
+            bus_attrs[bus]["p_removable"] += data["supply"] * 0.2
+        
+        # if we make international lines dynamic, we can also add and remove here.
+        if data['source'] == "international" and dynamic_iternational:
+            bus_attrs[bus]["p_addable"] += data['p_max'] - data['supply']
+            bus_attrs[bus]["p_removable"] += data["supply"] - data['p_min']
+        
+
+
         if data["source"]:
             bus_attrs[bus]["sources"].append(data["source"])
+        if bus_attrs[bus]["lat"] is None and pd.notna(data.get("lat")):
+            bus_attrs[bus]["lat"] = data["lat"]
+            bus_attrs[bus]["lon"] = data["lon"]
 
     for bus, attrs in bus_attrs.items():
         G.add_node(
@@ -403,7 +428,11 @@ def aggregate_graph(G_disagg, edges_final):
             demand=attrs["demand"],
             p_min=attrs["p_min"],
             p_max=attrs["p_max"],
-            source=", ".join(sorted(set(attrs["sources"])))
+            source=", ".join(sorted(set(attrs["sources"]))),
+            lat=attrs["lat"],
+            lon=attrs["lon"],
+            p_addable=attrs["p_addable"],
+            p_removable=attrs["p_removable"]
         )
 
     # Only add edges where both buses still exist in the aggregated graph
@@ -422,27 +451,21 @@ def aggregate_graph(G_disagg, edges_final):
 def print_graph(G):
     plt.figure(figsize=(12, 10))
 
-    # Use lon/lat as position; fall back to spring layout for nodes missing coordinates
-    pos_geo, pos_spring_needed = {}, []
-    for node, data in G.nodes(data=True):
-        if data.get("lon") is not None and data.get("lat") is not None:
-            pos_geo[node] = (data["lon"], data["lat"])
-        else:
-            pos_spring_needed.append(node)
+    G_plot = G.copy()
+    for node, data in list(G_plot.nodes(data=True)):
+        if not (pd.notna(data.get("lat")) and pd.notna(data.get("lon"))):
+            G_plot.remove_node(node)
 
-    if pos_spring_needed:
-        fallback = nx.spring_layout(G, seed=42)
-        for node in pos_spring_needed:
-            pos_geo[node] = fallback[node]
+    pos = {n: (float(d["lon"]), float(d["lat"])) for n, d in G_plot.nodes(data=True)}
 
     node_colors = [
-        "red" if G.nodes[n].get("source") == "international" else "steelblue"
-        for n in G.nodes()
+        "red" if "international" in str(G_plot.nodes[n].get("source", "")) else "steelblue"
+        for n in G_plot.nodes()
     ]
 
     nx.draw(
-        G,
-        pos_geo,
+        G_plot,
+        pos,
         node_color=node_colors,
         node_size=15,
         edge_color="gray",
