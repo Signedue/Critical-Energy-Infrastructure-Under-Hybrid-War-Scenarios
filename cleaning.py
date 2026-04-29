@@ -419,6 +419,7 @@ def aggregate_graph(G_disagg, edges_final, dynamic_iternational=False):
         if bus_attrs[bus]["lat"] is None and pd.notna(data.get("lat")):
             bus_attrs[bus]["lat"] = data["lat"]
             bus_attrs[bus]["lon"] = data["lon"]
+        
 
     for bus, attrs in bus_attrs.items():
         G.add_node(
@@ -447,8 +448,24 @@ def aggregate_graph(G_disagg, edges_final, dynamic_iternational=False):
 
     return G
 
-
 def print_graph(G):
+
+    plt.figure(figsize=(10, 8))
+
+    pos = nx.spring_layout(G, seed=42)  # layout algorithm
+
+    nx.draw(
+        G,
+        pos,
+        node_size=10,
+        edge_color="gray",
+        with_labels=False
+    )
+
+    plt.title("Danish Transmission Network (Topology)")
+    plt.show()
+
+def print_graph_coordinates(G):
     plt.figure(figsize=(12, 10))
 
     G_plot = G.copy()
