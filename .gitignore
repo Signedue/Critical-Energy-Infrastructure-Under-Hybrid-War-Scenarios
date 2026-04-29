@@ -1,1 +1,12 @@
 __pycache__
+
+# Office temp lock files
+~$*.xlsx
+
+# Generated xlsx outputs (source: publicdataexportv131450706334_with_lon_lat.xlsx)
+danish_grid_cleaned.xlsx
+danish_grid_graph_ready.xlsx
+scenario_results.xlsx
+single_removals_results.xlsx
+clean_gen.xlsx
+edges_final.xlsx
