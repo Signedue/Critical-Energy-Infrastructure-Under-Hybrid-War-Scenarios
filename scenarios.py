@@ -7,7 +7,7 @@ the attack module.
 
 Usage:
     from scenarios import SCENARIOS, DEFAULT_SIGMAS, SIGMAS
-    from scenarios import prepare_graph, apply_scenario_mean, sample_scenario
+    from scenarios import apply_scenario_mean, sample_scenario
 """
 
 import numpy as np
@@ -347,10 +347,6 @@ def _apply_tail_risk(rng, value, prob=0.1):
     return value * rng.uniform(0.5, 0.8) if rng.random() < prob else value
 
 
-# ---------------------------------------------------------------------------
-# Graph preparation — call once after loading network_graph.pkl
-# ---------------------------------------------------------------------------
-
 _FOREIGN_SOURCES = {'sweden', 'norway', 'germany', 'netherlands', 'uk'}
 
 _HVDC_EDGE_KEYS = [
@@ -364,19 +360,6 @@ _HVDC_EDGE_KEYS = [
     ('viking',     'hvdc_viking_pct'),
 ]
 
-
-def prepare_graph(G):
-    """Store supply_base / demand_base / capacity_base on graph elements.
-
-    Must be called once on the loaded network_graph.pkl before any scenario
-    is applied. Safe to call multiple times.
-    """
-    for _, d in G.nodes(data=True):
-        d.setdefault('supply_base',  d.get('supply',   0.0))
-        d.setdefault('demand_base',  d.get('demand',   0.0))
-    for _, _, d in G.edges(data=True):
-        d.setdefault('capacity_base', d.get('capacity', 0.0))
-    return G
 
 
 def _hvdc_factor_for(name, draw):
@@ -433,14 +416,17 @@ def _generation_factor(source, draw):
 
 
 # ---------------------------------------------------------------------------
-# Rebalancer
+# Rebalancer.
+# This function was made with the use of Claude Code, a generative AI tool from Anthropic
 # ---------------------------------------------------------------------------
 
 def _rebalance(G2):
     """Adjust dispatchable generation so total supply == total demand.
 
     Uses gas nodes as primary slack, then thermal (NaN-source) nodes.
-    Scales each group proportionally. Warns if gap cannot be closed.
+    Iteratively scales each group proportionally, clipping to [p_min, p_max].
+    Nodes that hit a bound are frozen; remaining free nodes absorb the residual.
+    Warns if gap cannot be closed.
     """
     def _gap(G):
         s = sum(d.get('supply', 0.0) for _, d in G.nodes(data=True))
@@ -452,23 +438,40 @@ def _rebalance(G2):
         return
 
     for src_type in ('gas', 'thermal'):
-        slack = [(n, d) for n, d in G2.nodes(data=True)
-                 if d.get('supply_base', d.get('supply', 0.0)) > 0
-                 and _is_dispatchable(d.get('source', ''))
-                 and (src_type == 'gas') == ('gas' in _src_str(d.get('source', '')))]
-        if not slack:
+        free = [(n, d) for n, d in G2.nodes(data=True)
+                if d.get('supply', 0.0) > 0
+                and _is_dispatchable(d.get('source', ''))
+                and (src_type == 'gas') == ('gas' in _src_str(d.get('source', '')))]
+        if not free:
             continue
 
-        total = sum(d.get('supply', 0.0) for _, d in slack)
-        if total <= 0:
-            continue
+        for _ in range(len(free) + 1):   # at most one node saturates per iteration
+            if abs(gap) < 1.0 or not free:
+                break
 
-        adjust = gap if gap > 0 else max(gap, -total)   # floor at zero
-        scale  = (total + adjust) / total
-        for _, d in slack:
-            d['supply'] = max(0.0, d['supply'] * scale)
+            total = sum(d['supply'] for _, d in free)
+            if total <= 0:
+                break
 
-        gap = _gap(G2)
+            target = total + gap
+            newly_frozen = []
+            for n, d in free:
+                p_min = d.get('p_min', 0.0)
+                p_max = d.get('p_max', float('inf'))
+                desired = d['supply'] * target / total
+                if desired <= p_min:
+                    d['supply'] = p_min
+                    newly_frozen.append((n, d))
+                elif desired >= p_max:
+                    d['supply'] = p_max
+                    newly_frozen.append((n, d))
+                else:
+                    d['supply'] = desired
+
+            frozen_ids = {n for n, _ in newly_frozen}
+            free = [(n, d) for n, d in free if n not in frozen_ids]
+            gap = _gap(G2)
+
         if abs(gap) < 1.0:
             return
 
@@ -489,15 +492,14 @@ def _rebalance(G2):
 def apply_scenario_to_grid(G, draw):
     """Return a scenario-adjusted copy of G.
 
-    G must have been through prepare_graph() at least once.
     After all fixed/HVDC scaling, calls _rebalance() to close the
     supply-demand gap using dispatchable (gas/thermal) nodes as slack.
     """
     G2 = G.copy()
 
     for n, data in G2.nodes(data=True):
-        supply_base = data.get('supply_base', data.get('supply', 0.0))
-        demand_base = data.get('demand_base', data.get('demand', 0.0))
+        supply_base = data.get('supply', 0.0)
+        demand_base = data.get('demand', 0.0)
         name        = data.get('name', '')
         source      = data.get('source', '')
 
@@ -518,7 +520,7 @@ def apply_scenario_to_grid(G, draw):
 
     # Scale HVDC edge capacities
     for u, v, data in G2.edges(data=True):
-        cap_base = data.get('capacity_base', data.get('capacity', 0.0))
+        cap_base = data.get('capacity', 0.0)
         hvdc_f   = _hvdc_factor_for(data.get('name', ''), draw)
         if hvdc_f is not None:
             data['capacity'] = cap_base * hvdc_f
@@ -588,7 +590,7 @@ def apply_scenario_mean(G, scenario):
     line_f = scenario.get('line_capacity_factor', 1.0)
     if line_f != 1.0:
         for u, v, data in G2.edges(data=True):
-            cap_base = data.get('capacity_base', data.get('capacity', 0.0))
+            cap_base = data.get('capacity', 0.0)
             # only derate non-HVDC edges (HVDC are already handled by hvdc_*_pct)
             if cap_base > 0 and _hvdc_factor_for(data.get('name', ''), mean_draw) is None:
                 data['capacity'] = cap_base * line_f
@@ -608,7 +610,7 @@ def apply_scenario_mean(G, scenario):
     if n_remove > 0:
         bc = nx.betweenness_centrality(G2, normalized=True)
         sub_bc = {n: v for n, v in bc.items()
-                  if G2.nodes[n].get('supply_base', G2.nodes[n].get('supply', 0.0)) == 0.0
+                  if G2.nodes[n].get('supply', 0.0) == 0.0
                   and not _is_foreign(G2.nodes[n].get('source'))}
         top_nodes = sorted(sub_bc, key=sub_bc.get, reverse=True)[:n_remove]
         for node_id in top_nodes:
@@ -617,9 +619,6 @@ def apply_scenario_mean(G, scenario):
             print(f'  pre_remove_top_n: removed {node_id} ({name}, betweenness={bc[node_id]:.4f})')
 
     return G2
-
-
-# build one representative graph per scenario
 
 
 # =============================================================================
