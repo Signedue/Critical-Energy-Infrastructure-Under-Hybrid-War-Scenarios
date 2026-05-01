@@ -84,7 +84,7 @@ from datetime import datetime
 import random
 
 # ── Configuration ──────────────────────────────────────────────────────────────
-N_GRAPHS_PER_CALL = 1
+N_GRAPHS_PER_CALL = 2000
 CALLS_PER_K       = {1: 1, 2: 2, 3: 4, 4: 8, 5: 16, 6: 32}
 CLOSENESS_FACTOR  = 1000.0
 MAX_WORKERS       = 10       # tune to available CPU cores / Gurobi license seats
