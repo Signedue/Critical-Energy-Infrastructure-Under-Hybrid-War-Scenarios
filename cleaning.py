@@ -411,14 +411,17 @@ def aggregate_graph(G_disagg, edges_final, dynamic_iternational=False):
         if data['source'] == "international" and dynamic_iternational:
             bus_attrs[bus]["p_addable"] += data['p_max'] - data['supply']
             bus_attrs[bus]["p_removable"] += data["supply"] - data['p_min']
-        
-
 
         if data["source"]:
             bus_attrs[bus]["sources"].append(data["source"])
         if bus_attrs[bus]["lat"] is None and pd.notna(data.get("lat")):
             bus_attrs[bus]["lat"] = data["lat"]
             bus_attrs[bus]["lon"] = data["lon"]
+        if bus_attrs[bus]["p_addable"] < 0.0:
+            bus_attrs[bus]["p_addable"] = 0.0
+        if bus_attrs[bus]["p_removable"] < 0.0:
+            bus_attrs[bus]["p_removable"] = 0.0
+        
         
 
     for bus, attrs in bus_attrs.items():
