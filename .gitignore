@@ -10,3 +10,6 @@ scenario_results.xlsx
 single_removals_results.xlsx
 clean_gen.xlsx
 edges_final.xlsx
+
+*.pt
+*.html
