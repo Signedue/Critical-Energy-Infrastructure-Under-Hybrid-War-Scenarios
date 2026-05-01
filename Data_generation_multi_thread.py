@@ -88,6 +88,7 @@ if __name__ == '__main__':
     CLOSENESS_FACTOR  = 1000.0
     MAX_WORKERS       = 10
     OUTPUT_DIR        = "results"
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     _RUN_TS = datetime.now().strftime("%Y%m%d_%H%M%S")
     OUT_CSV = os.path.join(OUTPUT_DIR, f"simulation_{_RUN_TS}.csv")
