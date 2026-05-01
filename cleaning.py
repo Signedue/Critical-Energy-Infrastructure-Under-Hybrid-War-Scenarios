@@ -451,24 +451,24 @@ def aggregate_graph(G_disagg, edges_final, dynamic_iternational=False):
 
     return G
 
-def print_graph(G):
-
+def print_graph(G, highlighted_nodes=[], highlighted_edges=[]):
     plt.figure(figsize=(10, 8))
+    pos = nx.spring_layout(G, seed=42)
+    h_nodes = set(highlighted_nodes)
+    h_edges = set(tuple(e) for e in highlighted_edges)
 
-    pos = nx.spring_layout(G, seed=42)  # layout algorithm
+    node_colors = ["red" if n in h_nodes else "steelblue" for n in G.nodes()]
+    node_sizes  = [80    if n in h_nodes else 10          for n in G.nodes()]
+    edge_colors = ["red" if (u, v) in h_edges or (v, u) in h_edges else "gray" for u, v in G.edges()]
+    edge_widths = [3.0   if (u, v) in h_edges or (v, u) in h_edges else 0.8    for u, v in G.edges()]
 
-    nx.draw(
-        G,
-        pos,
-        node_size=10,
-        edge_color="gray",
-        with_labels=False
-    )
-
+    nx.draw(G, pos, node_color=node_colors, node_size=node_sizes,
+            edge_color=edge_colors, width=edge_widths, with_labels=False)
     plt.title("Danish Transmission Network (Topology)")
     plt.show()
 
-def print_graph_coordinates(G):
+
+def print_graph_coordinates(G, highlighted_nodes=[], highlighted_edges=[]):
     plt.figure(figsize=(12, 10))
 
     G_plot = G.copy()
@@ -477,22 +477,23 @@ def print_graph_coordinates(G):
             G_plot.remove_node(node)
 
     pos = {n: (float(d["lon"]), float(d["lat"])) for n, d in G_plot.nodes(data=True)}
+    h_nodes = set(highlighted_nodes)
+    h_edges = set(tuple(e) for e in highlighted_edges)
 
-    node_colors = [
-        "red" if "international" in str(G_plot.nodes[n].get("source", "")) else "steelblue"
-        for n in G_plot.nodes()
-    ]
+    node_colors, node_sizes = [], []
+    for n in G_plot.nodes():
+        if n in h_nodes:
+            node_colors.append("red");    node_sizes.append(80)
+        elif "international" in str(G_plot.nodes[n].get("source", "")):
+            node_colors.append("orange"); node_sizes.append(15)
+        else:
+            node_colors.append("steelblue"); node_sizes.append(15)
 
-    nx.draw(
-        G_plot,
-        pos,
-        node_color=node_colors,
-        node_size=15,
-        edge_color="gray",
-        width=0.5,
-        with_labels=False
-    )
+    edge_colors = ["red" if (u, v) in h_edges or (v, u) in h_edges else "gray" for u, v in G_plot.edges()]
+    edge_widths = [3.0   if (u, v) in h_edges or (v, u) in h_edges else 0.5    for u, v in G_plot.edges()]
 
+    nx.draw(G_plot, pos, node_color=node_colors, node_size=node_sizes,
+            edge_color=edge_colors, width=edge_widths, with_labels=False)
     plt.title("Danish Transmission Network (Topology)")
     plt.tight_layout()
     plt.show()
