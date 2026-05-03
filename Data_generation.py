@@ -6,6 +6,7 @@ import cleaning
 from scenarios import SCENARIOS, DEFAULT_SIGMAS, sample_scenario, apply_scenario_to_grid
 from datetime import datetime
 import random
+import networkx as nx
 
 
 
@@ -34,8 +35,8 @@ base_scenario = g_unaggregated
 
 
 #  Configuration of our data generation
-N_SCENARIOS = 10 # This is how many scenarios the Monte-Carlo should generate
-N_GRAPHS_PER_CALL = 100 # This is how often we simulate_k_removals for one scenario generatio
+N_SCENARIOS = 1 # This is how many scenarios the Monte-Carlo should generate
+N_GRAPHS_PER_CALL = 10 # This is how often we simulate_k_removals for one scenario generatio
 CALLS_PER_K       = {1: 1, 2: 2, 3: 4, 4: 8, 5: 16, 6: 32}
 CLOSENESS_FACTOR  = 20.0
 OUTPUT_DIR        = "results"
@@ -54,16 +55,26 @@ n_completed = 0
 while True:
     draw_k = random.choices(keys, weights=weights, k=1)[0]
     draw_scenario_name = random.choice(list(SCENARIOS))
-    scenario_draws = sample_scenario(draw_scenario_name, SCENARIOS, DEFAULT_SIGMAS, n=N_GRAPHS_PER_CALL, seed=None)
+    seed = random.randint(0,2000000000)
+    scenario_draws = sample_scenario(draw_scenario_name, SCENARIOS, DEFAULT_SIGMAS, n=N_SCENARIOS, seed=seed)
     
     # This for loop will generate N_SCENARIOS * N_GRAPHS_PER_CALL rows each time
     for draw in scenario_draws:
         try:
-            draw_scenario = apply_scenario_to_grid(base_scenario, draw)
+            draw_scenario = cleaning.aggregate_graph(apply_scenario_to_grid(base_scenario, draw), edges)
+            
+            # stopp if imbalanced
+            total_supply = sum(nx.get_node_attributes(draw_scenario, 'supply').values())
+            total_demand = sum(nx.get_node_attributes(draw_scenario, 'demand').values())
+            if total_demand > 0 and abs(total_supply - total_demand) / total_demand > 0.01:
+                continue
+
+            draw_scenario.name = draw_scenario_name
             res = Evaluation.simulate_k_removals(draw_scenario, k=draw_k, n_graphs=N_GRAPHS_PER_CALL, closeness_factor=CLOSENESS_FACTOR)
             print(f"[{datetime.now().strftime('%H:%M:%S')}] #{n_completed+1} | scenario={draw_scenario.name}  k={draw_k}  errors={n_errors}")
             n_errors = 0
             n_completed += 1
+            res['seed'] = seed
             res.to_csv(OUT_CSV, mode='a', header=False, index=False)
         except Exception:
             n_errors +=1
