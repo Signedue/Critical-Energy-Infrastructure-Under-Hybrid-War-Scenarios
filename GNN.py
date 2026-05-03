@@ -109,6 +109,29 @@ def _parse_list(val):
         return list(ast.literal_eval(s))
     except (ValueError, SyntaxError):
         return []
+    
+
+# expects raw generated data
+def count_critical_elements(df, threshold=500):
+    high = df[df["total_unmet_demand_MW"] > threshold]
+
+    node_counts = {}
+    edge_counts = {}
+
+    for _, row in high.iterrows():
+        for n in _parse_list(row["removed_nodes"]):
+            node_counts[int(n)] = node_counts.get(int(n), 0) + 1
+        for e in _parse_list(row["removed_edges"]):
+            key = tuple(sorted(int(x) for x in e))
+            edge_counts[key] = edge_counts.get(key, 0) + 1
+
+    nodes_df = (pd.DataFrame(list(node_counts.items()), columns=["node_id", "count"])
+                .sort_values("count", ascending=False).reset_index(drop=True))
+    edges_df = (pd.DataFrame(list(edge_counts.items()), columns=["edge", "count"])
+                .sort_values("count", ascending=False).reset_index(drop=True))
+
+    return nodes_df, edges_df
+
 
 
 def _parse_removal_set(removed_nodes_val, removed_edges_val):
