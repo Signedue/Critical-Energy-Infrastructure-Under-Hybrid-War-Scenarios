@@ -13,6 +13,7 @@ Usage:
 import numpy as np
 import networkx as nx
 from copy import deepcopy
+import pandas as pd
 
 
 # =============================================================================
@@ -619,6 +620,24 @@ def apply_scenario_mean(G, scenario):
             print(f'  pre_remove_top_n: removed {node_id} ({name}, betweenness={bc[node_id]:.4f})')
 
     return G2
+
+
+def get_all_mean_scenarios(base_scenario):
+
+    BALANCE_TOL_PCT = 1.0   # allow up to 1 % residual gap
+
+    balanced_graphs = []
+    for sid, scenario in SCENARIOS.items():
+        G_sc = apply_scenario_mean(base_scenario, scenario)
+        total_supply = sum(d.get('supply', 0.0) for _, d in G_sc.nodes(data=True))
+        total_demand = sum(d.get('demand', 0.0) for _, d in G_sc.nodes(data=True))
+        gap          = abs(total_supply - total_demand)
+        gap_pct      = gap / max(total_demand, 1.0) * 100
+        if gap_pct <= BALANCE_TOL_PCT:
+            G_sc.name = sid
+            balanced_graphs.append(G_sc)
+
+    return balanced_graphs
 
 
 # =============================================================================
